@@ -192,6 +192,35 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
   bool active;// qp is active ?
   bool pending;
 
+
+  // RDMA stuff
+
+  // default RDMA switching threshold. If the configuration
+  // does not contain a threshold value, sockets use the below
+  // threshold for applying RDMA direct operations.
+  
+  /* 
+   * RDMA Direct operations are motivated by the fact
+   * that having multiple readers reading the same RDMA region
+   * (replication case) or a few simultaneous readers (erasure coding)
+   * is better than one entity handling all data transmission.
+   * Of course, adding such  a functionality to higher layers
+   * of the NetworkStack may result in better performance, but
+   * now let's just focus on the RDMA part (socket). 
+   **/
+ 
+  static const unsigned int RDMA_DIRECT_THRESH = 32 * 1024; // 32KB 
+
+  /*
+   * Structure used for RDMA direct memory
+   * verbs (WRITE, WRITE_IMM, READ). 
+   **/
+  struct rdma_rem_key_d {
+    uint32_t rkey;  
+    uint64_t raddr;
+  }; 
+
+
   void notify();
   ssize_t read_buffers(char* buf, size_t len);
   int post_work_request(std::vector<Chunk*>&);

@@ -416,16 +416,30 @@ void RDMADispatcher::handle_tx_event(ibv_wc *cqe, int n)
       }
     }
 
-    //TX completion may come either from regular send message or from 'fin' message.
-    //In the case of 'fin' wr_id points to the QueuePair.
-    if (get_stack()->get_infiniband().get_memory_manager()->is_tx_buffer(chunk->buffer)) {
-      tx_chunks.push_back(chunk);
-    } else if (reinterpret_cast<QueuePair*>(response->wr_id)->get_local_qp_number() == response->qp_num ) {
-      ldout(cct, 1) << __func__ << " sending of the disconnect msg completed" << dendl;
-    } else {
-      ldout(cct, 1) << __func__ << " not tx buffer, chunk " << chunk << dendl;
-      ceph_abort();
-    }
+
+    // RDMA Stack may use a variety of RDMA verbs.
+    // Need to check which one has been used.
+    switch(response->opcode) {
+    
+      case IBV_WC_SEND: {  // ordinary SEND 
+      
+        //TX completion may come either from regular send message or from 'fin' message.
+        //In the case of 'fin' wr_id points to the QueuePair.
+        if (get_stack()->get_infiniband().get_memory_manager()->is_tx_buffer(chunk->buffer)) {
+          tx_chunks.push_back(chunk);
+        } else if (reinterpret_cast<QueuePair*>(response->wr_id)->get_local_qp_number() == response->qp_num ) {
+          ldout(cct, 1) << __func__ << " sending of the disconnect msg completed" << dendl;
+        } else {
+          ldout(cct, 1) << __func__ << " not tx buffer, chunk " << chunk << dendl;
+          ceph_abort();
+        }
+      } // case IBV_SEND
+
+      case IBV_WC_RDMA_READ: { // RDMA READ 
+          /* ADD SOME CODE HERE */
+      }
+      
+
   }
 
   perf_logger->inc(l_msgr_rdma_tx_total_wc, n);

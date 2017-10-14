@@ -236,7 +236,7 @@ class Infiniband {
       uint32_t buffer_size;
       uint32_t num_chunk;
       Mutex lock;
-      std::vector<Chunk*> free_chunks;
+      std::list<Chunk*> free_chunks;
       char *base = nullptr;
       char *end = nullptr;
       Chunk* chunk_base = nullptr;

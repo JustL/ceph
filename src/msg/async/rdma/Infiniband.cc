@@ -210,7 +210,7 @@ int Infiniband::QueuePair::init()
   qpa.qp_state   = IBV_QPS_INIT;
   qpa.pkey_index = 0;
   qpa.port_num   = (uint8_t)(ib_physical_port);
-  qpa.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE;
+  qpa.qp_access_flags =  IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE;
   qpa.qkey       = q_key;
 
   int mask = IBV_QP_STATE | IBV_QP_PORT;
@@ -585,12 +585,13 @@ int Infiniband::MemoryManager::Cluster::fill(uint32_t num)
   assert(base);
   chunk_base = static_cast<Chunk*>(::malloc(sizeof(Chunk) * num));
   memset(chunk_base, 0, sizeof(Chunk) * num);
-  free_chunks.reserve(num);
-  ibv_mr* m = ibv_reg_mr(manager.pd->pd, base, bytes, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
+ 
+  ibv_mr* m = ibv_reg_mr(manager.pd->pd, base, bytes, IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
   assert(m);
   Chunk* chunk = chunk_base;
   for (uint32_t offset = 0; offset < bytes; offset += buffer_size){
     new(chunk) Chunk(m, buffer_size, base+offset);
+    // keep list sorted
     free_chunks.push_back(chunk);
     chunk++;
   }
@@ -600,10 +601,24 @@ int Infiniband::MemoryManager::Cluster::fill(uint32_t num)
 void Infiniband::MemoryManager::Cluster::take_back(std::vector<Chunk*> &ck)
 {
   Mutex::Locker l(lock);
+    
+  // find where to insert first
+  // may be the bottleneck for small messages, need to check
+  const char* front_val = ck.front->buffer;
+  auto itr = free_buffers.begin();
+  for(; itr != free_buffers.end(); ++itr) {
+    if(*itr->buffer > front_val) {
+      break;
+    }  
+  }
+
   for (auto c : ck) {
     c->clear();
-    free_chunks.push_back(c);
+    free_buffers.insert(itr, c);
+    // no need to update the iterator since we keep inserting
+    // chunks in front of the Chunk pointed by itr` 
   }
+
 }
 
 int Infiniband::MemoryManager::Cluster::get_buffers(std::vector<Chunk*> &chunks, size_t bytes)
@@ -617,9 +632,15 @@ int Infiniband::MemoryManager::Cluster::get_buffers(std::vector<Chunk*> &chunks,
     return 0;
   if (!bytes) {
     r = free_chunks.size();
-    for (auto c : free_chunks)
-      chunks.push_back(c);
-    free_chunks.clear();
+  
+    for (auto itr = free_chunks.begin(); itr != free_chunks.end();) {
+      chunks.push_back(*itr);
+      // handle the update
+      ++itr; // need to move further
+
+      free_chunks.pop_front();
+    }
+
     return r;
   }
   if (free_chunks.size() < num) {
@@ -627,8 +648,8 @@ int Infiniband::MemoryManager::Cluster::get_buffers(std::vector<Chunk*> &chunks,
     r = num;
   }
   for (uint32_t i = 0; i < num; ++i) {
-    chunks.push_back(free_chunks.back());
-    free_chunks.pop_back();
+    chunks.push_back(free_chunks.front);
+    free_chunks.pop_front();
   }
   return r;
 }
@@ -710,7 +731,7 @@ char *Infiniband::MemoryManager::PoolAllocator::malloc(const size_type bytes)
     return NULL;
   }
 
-  m->mr = ibv_reg_mr(manager->pd->pd, m->chunks, bytes, IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
+  m->mr = ibv_reg_mr(manager->pd->pd, m->chunks, bytes, IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
   if (m->mr == NULL) {
     lderr(cct) << __func__ << "failed to register " <<
         bytes << " + " << sizeof(*m) << " bytes of memory for " << nbufs << dendl;

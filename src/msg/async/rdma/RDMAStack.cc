@@ -410,7 +410,7 @@ void RDMADispatcher::handle_tx_event(ibv_wc *cqe, int n)
 
       if (conn && conn->is_connected()) {
         ldout(cct, 25) << __func__ << " qp state is : " << conn->get_qp_state() << dendl;//wangzhi
-        conn->fault();
+        conn->fault(response);
       } else {
         ldout(cct, 1) << __func__ << " missing qp_num=" << response->qp_num << " discard event" << dendl;
       }
@@ -437,6 +437,8 @@ void RDMADispatcher::handle_tx_event(ibv_wc *cqe, int n)
 
       case IBV_WC_RDMA_READ: { // RDMA READ 
           /* ADD SOME CODE HERE */
+          // need to notify the remote host that an operations
+          // is completed
       }
       
 

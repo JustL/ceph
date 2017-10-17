@@ -605,8 +605,9 @@ void Infiniband::MemoryManager::Cluster::take_back(std::vector<Chunk*> &ck)
   // find where to insert first
   // may be the bottleneck for small messages, need to check
   const char* front_val = ck.front->buffer;
-  auto itr = free_buffers.begin();
-  for(; itr != free_buffers.end(); ++itr) {
+  auto itr = free_chunks.begin();
+  
+  for(; itr != free_chunks.end(); ++itr) {
     if(*itr->buffer > front_val) {
       break;
     }  
@@ -614,7 +615,7 @@ void Infiniband::MemoryManager::Cluster::take_back(std::vector<Chunk*> &ck)
 
   for (auto c : ck) {
     c->clear();
-    free_buffers.insert(itr, c);
+    free_chunks.insert(itr, c);
     // no need to update the iterator since we keep inserting
     // chunks in front of the Chunk pointed by itr` 
   }

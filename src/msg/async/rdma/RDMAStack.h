@@ -210,15 +210,86 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
    **/
  
   static const unsigned int RDMA_DIRECT_THRESH = 32 * 1024; // 32KB 
+  
+  static const uint8_t RDMA_REQUEST_TAG = 1;
+  static const uint8_t RDMA_ACK_TAG     = 2;
+
+
+  /**
+   * Generic RDMA interface.
+   * All RDMA messages inherit this interface
+   */
+  struct rdma_msg_d {
+    uint8_t rdma_tag;
+  };
 
   /*
    * Structure used for RDMA direct memory
    * verbs (WRITE, WRITE_IMM, READ). 
    **/
-  struct rdma_rem_key_d {
+
+  struct rdma_remote_region_d : public rdma_msg_d {
+    uint32_t rlength; 
     uint32_t rkey;  
     uint64_t raddr;
+  };
+  
+  
+  /**
+   * RDNA Ack structure to acknoweledge RDMA
+   * completed RDMA operations
+   */
+  struct rdma_ack_d : public rdma_msg_d {
+    uint8_t  res_code
+    uint32_t rkey;
+    uint64_t raddr; 
+  };
+ 
+
+  enum class RDMAVerbState : int {
+    NEUTRAL          = 0,  // no RDMA actions required
+    SENT_ADDRESS     = 1,  // sent RDMA READ request
+    RECV_ACK         = 2,  // received RDMA ack from remote host
+    SENT_ACK         = 3,  // sent RDMA ack to a remote host
+    RDMA_READ_READY  = 4,  // ready to issue and RDMA read
+    
+    RDMA_ERROR       = -1  // error state
   }; 
+
+  // sender/receiver states
+  RDMAVerbState m_send_state; // RDAM sender state
+  RDMAVerbState m_recv_state; // RDMA receiver state
+  
+ 
+  // allocation map to know which rdma regions are allocated
+  // for remote reading
+  
+  /*Important note: key is SEND CHUNK address (control addres)*/
+  
+
+  // lock for modifying local memory used by remote hosts 
+  Mutex m_rdma_send_lock; 
+  
+  // lock for modyfing local memory used for RDMA results
+  Mutex m_rdma_read_lock; 
+
+
+  // for placing error/complete buffers
+  std::vector<Chunk*> m_free_send_bufs;
+  std::vector<Chunk*> m_free_read_bufs;
+  
+
+  // for storing state of currently happening RDMA operations
+  ceph::unordered_map<uint64_t, std::vector<Chunk*> > m_rdma_send_buf;
+  ceph::unordered_map<uint64_t, std::vector<Chunk*> > m_rdma_read_buf;  
+ 
+
+  /**
+   * Function takes an RDMA control message and 
+   * sends it to the remote host.
+   */ 
+  bool send_rdma_control(const struct rdma_msg_d* msg);
+
 
 
   void notify();
@@ -240,7 +311,7 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
   virtual void shutdown() override;
   virtual void close() override;
   virtual int fd() const override { return notify_fd; }
-  void fault();
+  void fault(const struct ibv_wc* const cperr = nullptr);
   const char* get_qp_state() { return Infiniband::qp_state_string(qp->get_state()); }
   ssize_t submit(bool more);
   int activate();
@@ -264,6 +335,7 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
       active = false;
     }
   };
+  
 };
 
 class RDMAServerSocketImpl : public ServerSocketImpl {

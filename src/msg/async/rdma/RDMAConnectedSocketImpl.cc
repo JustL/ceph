@@ -25,7 +25,9 @@ RDMAConnectedSocketImpl::RDMAConnectedSocketImpl(CephContext *cct, Infiniband* i
   : cct(cct), connected(0), error(0), infiniband(ib),
     dispatcher(s), worker(w), lock("RDMAConnectedSocketImpl::lock"),
     is_server(false), con_handler(new C_handle_connection(this)),
-    active(false), pending(false)
+    active(false), pending(false),
+    m_send_state(RDMAVerbState::NEUTRAL),
+    m_recv_state(RDMAVerbState::NEUTRAL)
 {
   qp = infiniband->create_queue_pair(
 				     cct, s->get_tx_cq(), s->get_rx_cq(), IBV_QPT_RC);
@@ -637,8 +639,16 @@ void RDMAConnectedSocketImpl::close()
   active = false;
 }
 
-void RDMAConnectedSocketImpl::fault()
+void RDMAConnectedSocketImpl::fault(const struct ibv_wc* const cperr)
 {
+
+  // check if it's a non-null
+  if(cperr && cperr->opcode == IBV_WC_RDMA_READ)
+  { // RDMA read failed
+    
+  }
+
+
   ldout(cct, 1) << __func__ << " tcp fd " << tcp_fd << dendl;
   /*if (qp) {
     qp->to_dead();

@@ -27,7 +27,9 @@ RDMAConnectedSocketImpl::RDMAConnectedSocketImpl(CephContext *cct, Infiniband* i
     is_server(false), con_handler(new C_handle_connection(this)),
     active(false), pending(false),
     m_send_state(RDMAVerbState::NEUTRAL),
-    m_recv_state(RDMAVerbState::NEUTRAL)
+    m_recv_state(RDMAVerbState::NEUTRAL),
+    m_rdma_send_seq(0),
+    m_rdam_rec_seq(0)
 {
   qp = infiniband->create_queue_pair(
 				     cct, s->get_tx_cq(), s->get_rx_cq(), IBV_QPT_RC);
@@ -556,6 +558,14 @@ int RDMAConnectedSocketImpl::post_work_request(std::vector<Chunk*> &tx_buffers)
     iswr[current_swr].num_sge = 1;
     iswr[current_swr].opcode = IBV_WR_SEND;
     iswr[current_swr].send_flags = IBV_SEND_SIGNALED;
+    
+    // add send sequence to that the receiver could deliver
+    // data to the client in order.
+    // makes easier to use direct RDMA operations
+    iswr[current_swr].imm_data = htonl(m_rdma_send_seq); 
+    // update seqeuence number
+    m_rdma_send_seq += isge[current_sge].length;
+ 
     /*if (isge[current_sge].length < infiniband->max_inline_data) {
       iswr[current_swr].send_flags = IBV_SEND_INLINE;
       ldout(cct, 20) << __func__ << " send_inline." << dendl;
@@ -643,10 +653,32 @@ void RDMAConnectedSocketImpl::fault(const struct ibv_wc* const cperr)
 {
 
   // check if it's a non-null
-  if(cperr && cperr->opcode == IBV_WC_RDMA_READ)
-  { // RDMA read failed
+  if(cperr && cperr->opcode == IBV_WC_RDMA_READ) {
+  
+    ldout(cct, 1) << __func__ " RDMA READ failed." << dendl;
+ 
+    // RDMA read failed
+    // need to release memory for reading
+    Mutex::Locker l(m_rdma_read_lock);
     
-  }
+    // get the address to release
+    const uint64_t laddr = cperr->wr_id;
+    auto itr_del = m_rdma_read_buf.find(laddr);
+    
+    if(itr_del != m_rdma_read_buf.end()) {
+      // move this region to the delete vectors
+      m_free_read_bufs.push_back(
+          std::move(itr_del->second));
+
+      // delete the memory region from the registered map
+      m_rdma_read_buf.erase(itr_del);
+    }
+    else {
+      ldout(cct, 10) << __func__ << 
+          " RDMA READ buffer has not been preallocated" << dendl;
+    }//else
+      
+  }//if
 
 
   ldout(cct, 1) << __func__ << " tcp fd " << tcp_fd << dendl;

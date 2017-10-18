@@ -229,6 +229,7 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
    **/
 
   struct rdma_remote_region_d : public rdma_msg_d {
+    uint32_t uq_key;  // unique rdma key 
     uint32_t rlength; 
     uint32_t rkey;  
     uint64_t raddr;
@@ -272,16 +273,25 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
   
   // lock for modyfing local memory used for RDMA results
   Mutex m_rdma_read_lock; 
+ 
 
+  // for ensuring that data to the user is delivered in order
+  uint32_t  m_rdma_send_seq; // for sending sequence number
+  uint32_t  m_rdma_recv_seq; // for receiving sequence number
+
+
+  // need to ensure that data always delivered in order
+  std::map<uint32_t, uint64_t, std::function<bool(const uint32_t&, const uint64_t&)> > m_rdma_rec_buffers;
+    
 
   // for placing error/complete buffers
-  std::vector<Chunk*> m_free_send_bufs;
-  std::vector<Chunk*> m_free_read_bufs;
+  std::vector<std::pair<uint32_t, std::vector<Chunk*> > m_free_read_bufs;
   
+
 
   // for storing state of currently happening RDMA operations
   ceph::unordered_map<uint64_t, std::vector<Chunk*> > m_rdma_send_buf;
-  ceph::unordered_map<uint64_t, std::vector<Chunk*> > m_rdma_read_buf;  
+  ceph::unordered_map<uint64_t, std::pair<uint32_t, std::vector<Chunk*> > > m_rdma_read_buf;  
  
 
   /**
@@ -289,7 +299,27 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
    * sends it to the remote host.
    */ 
   bool send_rdma_control(const struct rdma_msg_d* msg);
+ 
+  /**
+   * Function determines if seq1 is larger than seq2.
+   * 
+   * Function is provided by HKUST-SING laboratory:
+   * can be found at: hithub.com/HKUST-SING/PIAS-Software/
+   */
+  bool rdma_is_seq_larger(const uint32_t seq1, const uint32_t seq2) {
+   
+    static const uint32_t SEQ_OVERFLOW_VALUE = 4294900000;
 
+    if((seq1 > seq2) && (seq1 - seq2 <= SEQ_OVERFLOW_VALUE)) {
+      return true;
+    }
+    
+    if((seq1 < seq2) && (seq2 - seq1 > SEQ_OVERFLOW_VALUE)) {
+      return true;
+    }
+
+    return false;    
+  } 
 
 
   void notify();

@@ -20,14 +20,17 @@
 #undef dout_prefix
 #define dout_prefix *_dout << " RDMAConnectedSocketImpl "
 
+
+static const size_t RDMA_CONTROL_MSG = sizeof("00000000:00000000:00000000:00000000:00000000");
+
+
 RDMAConnectedSocketImpl::RDMAConnectedSocketImpl(CephContext *cct, Infiniband* ib, RDMADispatcher* s,
 						 RDMAWorker *w)
   : cct(cct), connected(0), error(0), infiniband(ib),
     dispatcher(s), worker(w), lock("RDMAConnectedSocketImpl::lock"),
     is_server(false), con_handler(new C_handle_connection(this)),
     active(false), pending(false),
-    m_send_state(RDMAVerbState::NEUTRAL),
-    m_recv_state(RDMAVerbState::NEUTRAL),
+    m_rdma_rec_buffers([](const uint32_t& seq1, const uint32_t& seq2) -> bool {return !rdma_is_seq_larger(seq1, seq2)}),
     m_rdma_send_seq(0),
     m_rdam_rec_seq(0)
 {
@@ -202,6 +205,13 @@ int RDMAConnectedSocketImpl::try_connect(const entity_addr_t& peer_addr, const S
 }
 
 void RDMAConnectedSocketImpl::handle_connection() {
+  
+  if(connected == 1) {
+    handle_rdma_control();
+    return;
+  }  
+
+  
   ldout(cct, 20) << __func__ << " QP: " << my_msg.qpn << " tcp_fd: " << tcp_fd << " notify_fd: " << notify_fd << dendl;
   int r = infiniband->recv_msg(cct, tcp_fd, peer_msg);
   if (r <= 0) {
@@ -259,6 +269,48 @@ void RDMAConnectedSocketImpl::handle_connection() {
   }
 }
 
+
+
+void handle_rdma_structures(const std::vector<uint32_t>& compl_rdma,
+     std::vector<std::pair<uint32_t, Chunk*> >& inter_rec)
+
+  ldout(cct, 20) << __func__ " need to append RDMA structures." << dendl;
+  Mutex::Locker l(lock); // need a lock
+
+  if(!compl_rdma.empty()) {
+    // release RDMA memory
+    
+    for(const auto& reg_id : compl_rdma) {
+    
+      auto reg_itr = m_rdma_send_buf.find(reg_id);
+      
+      if(reg_itr != m_rdma_send_buf.end()) {
+        ldout(cct, 10) << __func__ << " cannot find RDMA SEND region." << dendl;
+
+        // iterate though the vector and release memory
+        for(const auto& chunk : reg_itr->second) {
+          dispatcher->post_chunk_to_pool(chunk);
+        }
+        
+        // delete allocation of RDMA memory
+        m_rdma_send_buf.erase(reg_itr);         
+ 
+      }
+ 
+    }
+ 
+  }
+
+  // handle out_of_order work requests to preserve data order
+  if(!inter_rec.empty()) {
+    // need to move to the preserved map
+    
+    for(auto&& out_order : inter_rec) {
+      m_rdma_rec_buffers.insert(std::move(out_order));
+    }
+  }
+
+
 ssize_t RDMAConnectedSocketImpl::read(char* buf, size_t len)
 {
   uint64_t i = 0;
@@ -294,11 +346,35 @@ ssize_t RDMAConnectedSocketImpl::read(char* buf, size_t len)
     }
   }
 
+  // for RDMA Read notifications
+  std::vector<uint32_t> rdma_cmpls(cqe.size());
+
+  // for buffering out of order works
+  std::vector< std::pair<uint32_t, Chunk*> > rdma_out_of_order(cqe.size()); 
+
+  bool out_of_order = false; // when to start buffering
+
+
   ldout(cct, 20) << __func__ << " poll queue got " << cqe.size() << " responses. QP: " << my_msg.qpn << dendl;
   for (size_t i = 0; i < cqe.size(); ++i) {
     ibv_wc* response = &cqe[i];
     assert(response->status == IBV_WC_SUCCESS);
+
+    // need to check if IBV_WR_RDMA_WRITE_WITH_IMM
     Chunk* chunk = reinterpret_cast<Chunk *>(response->wr_id);
+    if(response->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+      
+      assert(!response->byte_len); // no data is sent       
+
+      const uint32_t rdma_reg_id = ntohl(reponse->imm_data);    // need to retrieve host-based value
+      ldout(cct, 25) << __func__ << "WRITE_IMM ID: " << static_cast<long>(rdma_reg_id) << dendl;
+
+      rdma_cmpls.push_back(rdma_reg_id);
+      // done with this chunk
+      dispathcer->post_chunk_to_pool(chunk);
+      continue;
+    }
+
     ldout(cct, 25) << __func__ << " chunk length: " << response->byte_len << " bytes." << chunk << dendl;
     chunk->prepare_read(response->byte_len);
     worker->perf_logger->inc(l_msgr_rdma_rx_bytes, response->byte_len);
@@ -310,6 +386,25 @@ ssize_t RDMAConnectedSocketImpl::read(char* buf, size_t len)
       }
       dispatcher->post_chunk_to_pool(chunk);
     } else {
+      
+      // means a proper work request
+      // need to check the sequence number
+      
+ 
+     const uint32_t rec_sec = ntohl(response->imm_data);
+
+     if(out_of_order || !rdma_is_seq_larger(rec_sec, m_rdma_recv_seq.load())) {
+       out_of_order = true;
+       // buffer data
+       rdma_out_of_order.push_back(std::make_pair<uint32_t, Chunk*>(rec_sec, chunk));
+       
+       continue
+     }
+
+      // need to update recv_seq number
+      m_rdma_recv_seq.fetch_add(response->byte_len);
+
+
       if (read == (ssize_t)len) {
         buffers.push_back(chunk);
         ldout(cct, 25) << __func__ << " buffers add a chunk: " << response->byte_len << dendl;
@@ -330,6 +425,12 @@ ssize_t RDMAConnectedSocketImpl::read(char* buf, size_t len)
     connected = 1; //if so, we don't need the last handshake
     cleanup();
     submit(false);
+  }
+
+  // need to pass the data structures for the internal use
+  if(!rdma_cmpls.empty() || !rdma_out_of_order.empty()) {
+    // need to update internal data structures
+    handle_rdma_structures(rdma_compls, rdma_out_of_order);    
   }
 
   if (!buffers.empty()) {
@@ -422,16 +523,44 @@ ssize_t RDMAConnectedSocketImpl::send(bufferlist &bl, bool more)
   size_t bytes = bl.length();
   if (!bytes)
     return 0;
+
+
+  // check if object is greater then a threshold
+
+  bool direct_RDMA = false; // if need direct RDMA operation 
+
+  if(bytes >= RDMAConnectedSocketImpl::RDMA_DIRECT_THRESH) {
+    direct_RDMA = true;
+  } 
+
+
   {
     Mutex::Locker l(lock);
-    pending_bl.claim_append(bl);
+     
+    
+    // need to check if use RDMA READ
+    if(direct_RDMA) {
+      // Direct memory access (RDMA READ)
+      bufferlist data_buff;
+      data_buff.claim_append(bl);
+      m_rdma_data.push_back(std::make_pair<char*, bufferlist>(pending_bl.buffers().back.raw_c_str(), std::move(data_buff)));
+    }
+    else {  
+      pending_bl.claim_append(bl);
+    }
+
     if (!connected) {
+
       ldout(cct, 20) << __func__ << " fake send to upper, QP: " << my_msg.qpn << dendl;
       return bytes;
     }
   }
   ldout(cct, 20) << __func__ << " QP: " << my_msg.qpn << dendl;
+
+
+  
   ssize_t r = submit(more);
+ 
   if (r < 0 && r != -EAGAIN)
     return r;
   return bytes;
@@ -487,22 +616,50 @@ ssize_t RDMAConnectedSocketImpl::submit(bool more)
   std::list<bufferptr>::const_iterator copy_it = it;
   unsigned total = 0;
   unsigned need_reserve_bytes = 0;
+
+  uint32_t rdma_seq_offset = 0
+  bool     apply_rdma = false;
+ 
+
   while (it != pending_bl.buffers().end()) {
+    if(!m_rdma_data.empty() && 
+        m_rdma_data.front.first == itr->raw_c_str()) {
+    
+      // after this operation, RDMA Read waits
+      apply_rdma = true; 
+    }
+  
     if (infiniband->is_tx_buffer(it->raw_c_str())) {
       if (need_reserve_bytes) {
         unsigned copied = fill_tx_via_copy(tx_buffers, need_reserve_bytes, copy_it, it);
         total += copied;
-        if (copied < need_reserve_bytes)
+        if (copied < need_reserve_bytes) {
+          if(apply_rdma) {
+            // need to update key
+            
+          }
           goto sending;
+        }
         need_reserve_bytes = 0;
       }
       assert(copy_it == it);
       tx_buffers.push_back(infiniband->get_tx_chunk_by_buffer(it->raw_c_str()));
+      ++rdma_seq_offset;
       total += it->length();
       ++copy_it;
     } else {
       need_reserve_bytes += it->length();
     }
+    
+    if(apply_rdma)
+    {
+      apply_rdma = false; 
+      // set sequence number for this read
+      
+       
+      perform_rdma_read(rdma_seq_offset); 
+    }
+
     ++it;
   }
   if (need_reserve_bytes)
@@ -531,6 +688,140 @@ ssize_t RDMAConnectedSocketImpl::submit(bool more)
   ldout(cct, 20) << __func__ << " finished sending " << bytes << " bytes." << dendl;
   return pending_bl.length() ? -EAGAIN : 0;
 }
+
+
+ssize_t RDMAConnectedSocketImpl::perform_rdma_read() {
+  
+
+
+  rdma_remote_region_d read_request;
+  read_request.rdma_tag = RDMA_REQUEST_TAG;
+  read_request.uq_key  = 0;
+  read_request.rlength = 0;
+  read_request.rkey    = 0; // Chunk key since they all share one  
+                            // region
+
+  read_request.raddr   = 0;  // Chunk address
+
+  const bool result = send_rdma_control(&read_request);
+
+  return ((result) ? 0 : -1);
+
+}
+
+bool RDMAConectedSocketImpl::send_rdma_control(const struct rdma_msg_d* msg){
+
+  assert(tcp_fd >= 0);
+
+  switch(msg->rdma_tag) {
+    case RDMAConnectedSocketImpl::RDMA_REQUEST_TAG: {
+    
+      // cast message
+      const struct rdma_remote_region_d* ptr = static_cast<const struct rdma_remote_region_d*>(msg);
+
+      if(!ptr) { // casting error
+        return false;
+      }
+
+      // need to send message
+      char control_msg[RDMA_CONTROL_MSG];     
+
+
+      const uint32_t net_uq_key   =  htonl(ptr->uq_key);
+      const uint32_t net_rlength  =  htonl(ptr->rlength);
+      const uint32_t net_rkey     =  htonl(ptr->rkey);
+      
+      const uint32_t upper_bits   = (uint32_t)((ptr->raddr & 0xFFFFFFFF00000000) >> 32);
+ 
+      const uint32_t lower_bits   = (uint32_t)(ptr->raddr & 0x00000000FFFFFFFF);
+
+      const uint32_t net_upper    = htonl(upper_bits);
+      const uint32_t net_lower    = htonl(lower_bits);
+
+
+      sprintf(control_msg, "%08x:%08x:%08x:%08x:%08x", 
+              net_uq_key, net_rlength, net_key, net_addr,
+              net_upper, net_lower); 
+
+      
+       ssize_t r;
+       size_t cur_ptr = 0;
+   
+
+       size_t max_write =  sizeof(control_msg);
+   
+       retry:
+       r = ::write(tcp_fd, (control_msg + cur_ptr), (max_write - cur_ptr));
+       
+       if ((size_t)r != (max_write - cur_ptr)) {
+         if(r <= 0) {
+           return false;
+         }
+         
+         cur_ptr += (size_t) r;  
+         goto retry;
+       }
+
+       return true
+      
+    }
+
+    default: {return false;} 
+
+  }
+
+  return false;
+  
+}
+
+bool RDMAConnectedSocketImpl::handle_rdma_control() {
+  // read
+
+  assert(tcp_fd >= 0);
+
+  char rdma_control_msg[RDMA_CONTROL_MSG];
+  
+  size_t cur_ptr = 0;
+  const size_t max_msg_read = sizeof(rdma_control_msg);
+  
+  ssize_t r;
+
+  while(cur_ptr != max_msg_read) {
+    r = ::read(tcp_fd, &rdma_control_msg, (max_msg_read - cur_ptr));
+    
+    if(r <= 0) {
+      return false;
+    }  
+
+    cur_ptr += (size_t) r;
+  }
+
+  // read the received message
+  uint32_t net_uq_key, net_rlength, net_rkey, net_upper, net_lower;
+
+  sscanf(rdma_control_message, "%x:%x:%x:%x:%x", 
+        &net_uq_key, &net_rlength, &net_rkey, 
+        &net_upper, &net_upper);
+
+  rdma_remote_region_d temp_remote;
+  temp_remote.uq_key   =  ntohl(net_uq_key);
+  temp_remote.rlength  =  ntohl(net_rlength);
+  temp_remote.rkey     =  ntohl(net_rkey);
+  
+  const uint32_t host_upper = ntohl(net_upper);
+  const uint32_t host_lower = ntohl(net_lower);
+  
+  temp_remote.raddr  = ((uint64_t) host_upper << 32) & 0xFFFFFFFF00000000;
+  temp_remote.raddr != ((uint64_t host_lower) & 0x00000000FFFFFFFF);
+
+  // enqueue request or something
+
+
+  
+  return true; // read message
+
+}
+
 
 int RDMAConnectedSocketImpl::post_work_request(std::vector<Chunk*> &tx_buffers)
 {
@@ -564,7 +855,13 @@ int RDMAConnectedSocketImpl::post_work_request(std::vector<Chunk*> &tx_buffers)
     // makes easier to use direct RDMA operations
     iswr[current_swr].imm_data = htonl(m_rdma_send_seq); 
     // update seqeuence number
-    m_rdma_send_seq += isge[current_sge].length;
+    if(m_rdma_send_seq == 0xFFFFFFFF) {
+      // reset sequene number
+      m_rdma_send_seq = 0;
+    }
+    else { 
+      ++m_rdma_send_seq;
+    }
  
     /*if (isge[current_sge].length < infiniband->max_inline_data) {
       iswr[current_swr].send_flags = IBV_SEND_INLINE;
@@ -665,9 +962,9 @@ void RDMAConnectedSocketImpl::fault(const struct ibv_wc* const cperr)
     const uint64_t laddr = cperr->wr_id;
     auto itr_del = m_rdma_read_buf.find(laddr);
     
-    if(itr_del != m_rdma_read_buf.end()) {
+    if(itr_del != m_rdma_rdma_read_buf.end()) {
       // move this region to the delete vectors
-      m_free_read_bufs.push_back(
+      m_free_rdma_bufs.push_back(
           std::move(itr_del->second));
 
       // delete the memory region from the registered map

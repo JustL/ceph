@@ -21,6 +21,8 @@
 
 #include <list>
 #include <vector>
+#include <map>
+#include <utility>
 #include <thread>
 
 #include "common/ceph_context.h"
@@ -209,11 +211,10 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
    * now let's just focus on the RDMA part (socket). 
    **/
  
-  static const unsigned int RDMA_DIRECT_THRESH = 32 * 1024; // 32KB 
+  static const size_t RDMA_DIRECT_THRESH = 32 * 1024; // 32KB 
   
-  static const uint8_t RDMA_REQUEST_TAG = 1;
-  static const uint8_t RDMA_ACK_TAG     = 2;
-
+  static const uint8_t RDMA_REQUEST_TAG = 0x01;
+  static const uint8_t RDMA_ACK_TAG     = 0x02;
 
   /**
    * Generic RDMA interface.
@@ -246,51 +247,35 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
     uint64_t raddr; 
   };
  
-
-  enum class RDMAVerbState : int {
-    NEUTRAL          = 0,  // no RDMA actions required
-    SENT_ADDRESS     = 1,  // sent RDMA READ request
-    RECV_ACK         = 2,  // received RDMA ack from remote host
-    SENT_ACK         = 3,  // sent RDMA ack to a remote host
-    RDMA_READ_READY  = 4,  // ready to issue and RDMA read
-    
-    RDMA_ERROR       = -1  // error state
-  }; 
-
-  // sender/receiver states
-  RDMAVerbState m_send_state; // RDAM sender state
-  RDMAVerbState m_recv_state; // RDMA receiver state
-  
  
   // allocation map to know which rdma regions are allocated
   // for remote reading
   
-  /*Important note: key is SEND CHUNK address (control addres)*/
-  
-
-  // lock for modifying local memory used by remote hosts 
-  Mutex m_rdma_send_lock; 
-  
-  // lock for modyfing local memory used for RDMA results
+    
+  // lock for modyfing local memory used for RDMA read buffers
   Mutex m_rdma_read_lock; 
- 
-
+  
+  
   // for ensuring that data to the user is delivered in order
-  uint32_t  m_rdma_send_seq; // for sending sequence number
-  uint32_t  m_rdma_recv_seq; // for receiving sequence number
+  uint32_t  m_rdma_send_seq; // for sending sequence unit - work request 
+                             // number(no need for atomic)
+ 
+  // recv must be atomic
+  std::atomic<uint32_t>  m_rdma_recv_seq; // for receiving sequence number
+                                          // unit -- work request
 
 
   // need to ensure that data always delivered in order
-  std::map<uint32_t, uint64_t, std::function<bool(const uint32_t&, const uint64_t&)> > m_rdma_rec_buffers;
+  std::map<uint32_t, Chunk*, std::function<bool(const uint32_t&, const uint64_t&)> > m_rdma_rec_buffers;
     
-
   // for placing error/complete buffers
-  std::vector<std::pair<uint32_t, std::vector<Chunk*> > m_free_read_bufs;
-  
-
-
+  std::vector<std::pair<uint32_t, std::vector<Chunk*> > m_free_rdma_bufs;
+ 
   // for storing state of currently happening RDMA operations
-  ceph::unordered_map<uint64_t, std::vector<Chunk*> > m_rdma_send_buf;
+  ceph::unordered_map<uint32_t, std::vector<Chunk*> > m_rdma_send_buf;
+  std::vector<std::pair<char*, bufferlist> > m_rdma_data;  
+ 
+
   ceph::unordered_map<uint64_t, std::pair<uint32_t, std::vector<Chunk*> > > m_rdma_read_buf;  
  
 
@@ -300,6 +285,11 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
    */ 
   bool send_rdma_control(const struct rdma_msg_d* msg);
  
+
+  void perform_rdma_read();
+  bool handle_rdma_control();  
+
+
   /**
    * Function determines if seq1 is larger than seq2.
    * 
@@ -321,6 +311,34 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
     return false;    
   } 
 
+  /**
+   * Function returns lower bound of sequence numbers for
+   * the passed value. Follows TCP logic that as long as
+   * the window is (1/2) NUmber of seqeunce numbers it works.
+   * 
+   * @return : lower bound of a window (inclusive window) -->
+    *          return value cannot be used -- current window value
+   */
+  uint32_t get_lower_seq_number(uint32_t seq_num) {
+    // MAX_SEQ_NUMBERS = 2^32 = 4294967296
+    // MAX_WINDOW_SIZE = 2^31 = 2147483648
+    
+    if(seq_num >= 2147483648) {
+      return (seq_num - 2147483647);
+    }
+    
+    else {
+      return (seq_num + 2147483647);
+    }
+
+  }
+
+  /** 
+   * Receive signal to release memory from a remote host
+   *
+   */ 
+  void handle_rdma_structures(const std::vector<uint32_t>& send_buff,
+  std::vector<std::pair<uint32_t, Chunk*> >& inter_rec);  
 
   void notify();
   ssize_t read_buffers(char* buf, size_t len);

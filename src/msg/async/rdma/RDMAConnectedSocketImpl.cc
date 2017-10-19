@@ -31,8 +31,11 @@ RDMAConnectedSocketImpl::RDMAConnectedSocketImpl(CephContext *cct, Infiniband* i
     is_server(false), con_handler(new C_handle_connection(this)),
     active(false), pending(false),
     m_rdma_rec_buffers([](const uint32_t& seq1, const uint32_t& seq2) -> bool {return !rdma_is_seq_larger(seq1, seq2)}),
+    m_rdma_read_lock("RDMAConnectedSocketImpl::m_rdma_read_lock"),
+    m_rdma_gl_lock("RDMAConnectedSocketImpl::m_rdma_gl_lock"),
     m_rdma_send_seq(0),
-    m_rdam_rec_seq(0)
+    m_rdam_rec_seq(0),
+    m_last_append_RDMA(false)
 {
   qp = infiniband->create_queue_pair(
 				     cct, s->get_tx_cq(), s->get_rx_cq(), IBV_QPT_RC);
@@ -59,6 +62,22 @@ RDMAConnectedSocketImpl::~RDMAConnectedSocketImpl()
   for (unsigned i=0; i < buffers.size(); ++i) {
     dispatcher->post_chunk_to_pool(buffers[i]);
   }
+
+
+  // release the READ/local memory 
+  for(auto& m_item : m_rdma_read_buf) {
+    for(auto& chunk : m_item.second) {
+      dispatcher->post_chunk_to_pool(chunk);
+    }
+  }
+
+  // release the READ/remote memory
+  for(auto& m_item : m_rdma_send_buf) {
+      dispatcher->post_tx_buffer(m_item.second);
+  }
+
+  
+
 
   Mutex::Locker l(lock);
   if (notify_fd >= 0)
@@ -271,45 +290,136 @@ void RDMAConnectedSocketImpl::handle_connection() {
 
 
 
-void handle_rdma_structures(const std::vector<uint32_t>& compl_rdma,
-     std::vector<std::pair<uint32_t, Chunk*> >& inter_rec)
+void RDMAConnectedSocketImpl::handle_rdma_structures(const std::vector<uint32_t>& compl_rdma,
+                                    const std::vector<uint64_t>& pending_replies,
+                                    std::vector<std::pair<uint32_t, Chunk*> >& inter_rec) {
 
   ldout(cct, 20) << __func__ " need to append RDMA structures." << dendl;
-  Mutex::Locker l(lock); // need a lock
 
-  if(!compl_rdma.empty()) {
-    // release RDMA memory
+  // first check for completed rdma reads
+  std::vector<std::pair<uint32_t, Chunk*> > read_data(pending_replies.size());
+
+  if(!pending_replies.empty()) {
+    Mutex::Locker l(m_rdma_read_lock);
     
-    for(const auto& reg_id : compl_rdma) {
-    
-      auto reg_itr = m_rdma_send_buf.find(reg_id);
+    // read finished RDMA operations
+    for(const auto& rdma_key : pending_replies) {
+      auto itr = m_rdma_read_buf.find(rdma_key);
       
-      if(reg_itr != m_rdma_send_buf.end()) {
-        ldout(cct, 10) << __func__ << " cannot find RDMA SEND region." << dendl;
+      if(itr == m_rdma_read_buf.end()) {
+        ldout(cct, 1) << __func__ <<" cannot find an finished RDMA Read in the m_rdma_read_buf." << dendl;
+        continue;
+      }
+      
+      read_data.push_back(std::move(itr->second));
 
-        // iterate though the vector and release memory
-        for(const auto& chunk : reg_itr->second) {
-          dispatcher->post_chunk_to_pool(chunk);
-        }
+      m_rdma_read_buf.erase(itr);
+ 
+    }// for
+
+  }// end if
+
+  // done reading READ structures
+
+
+  {
+    Mutex::Locker l(m_rdma_gl_lock); // need a lock
+
+    if(!compl_rdma.empty()) {
+      // release RDMA memory
+    
+      for(const auto& reg_id : compl_rdma) {
+    
+        auto reg_itr = m_rdma_send_buf.find(reg_id);
+      
+        if(reg_itr != m_rdma_send_buf.end()) {
+          ldout(cct, 10) << __func__ << " cannot find RDMA SEND region." << dendl;
+
+          infiniband->get_memory_manager()->return_tx(reg_itr->second);
         
-        // delete allocation of RDMA memory
-        m_rdma_send_buf.erase(reg_itr);         
+          // delete allocation of RDMA memory
+          m_rdma_send_buf.erase(reg_itr);         
+ 
+        }
  
       }
  
     }
- 
-  }
 
-  // handle out_of_order work requests to preserve data order
-  if(!inter_rec.empty()) {
-    // need to move to the preserved map
+    // handle out_of_order work requests to preserve data order
+    if(!inter_rec.empty() || !read_data.empty()) {
+      // need to move to the preserved map
     
-    for(auto&& out_order : inter_rec) {
-      m_rdma_rec_buffers.insert(std::move(out_order));
+      for(auto&& out_order : inter_rec) {
+        m_rdma_rec_buffers[out_order->first] = std::move(out_order->second);
+      }
+       
+      for(auto&& cmpl_read : read_data) {
+        
+         // RDMA READ may not complete in the same order as they are
+         // submitted 
+         m_rdma_rec_buffers[cmpl_read->first](std::move(cmpl_read->second));
+      }
+
+      uint32_t key_val = m_rdma_recv_seq.load();
+      auto reorder_itr = m_rdma_rec_buffers.begin();      
+
+      if(key_val == reorder_itr->first) {
+        
+        
+ 
+        std::vector<ibv_wc> new_updates(read_data.size());
+        ibv_wc tmp_wc;
+
+        do {
+          tmp_wc.wr_id    = reinterpret_cast<uint64_t>(reorder_itr->second);
+          tmp_wc.status   = IBV_WC_SUCCESS;
+          tmp_wc.opcode   = IBV_WC_SEND;
+          tmp_wc.imm_data = htonl(key_val);
+          tmp_wc.byte_len = reorder_itr->get_bound();
+
+          new_updates.push_back(tmp_wc);      
+          ++key_val;
+          ++reorder_itr;
+           m_rdma_rec_buffers.erase(m_rdma_rec_buffers.begin());
+
+        // DESIGN ISSUE: MAY overflow
+        } while((order_itr != m_rdma_rec_buffers.end()) && (key_val == order_itr->first))
+
+      
+        pass_wc(std::move(new_updates));
+
+       }
+
+    } // if
+  }// global mutex
+
+
+  // may need to send WRITE IMMEDIATE
+  if(!read_data.empty()) {
+    // need to send completion signals
+    ibv_send_wr tmp_wr;
+    tmp_wr.wr_id = reinterpret_cast<uint64_t>(qp);
+    tmp_wr.num_sge = 0;
+    tmp_wr.opcode  = IBV_WR_RDMA_WRITE_WITH_IMM;
+    tmp_wr.send_flags = 0;
+    ibv_send_Wr *bad_tx_work_request;    
+
+    for(auto&& val : read_data) {
+      tmp_wr.imm_data = htonl(val->first);
+
+      if(ibv_post_send(qp->get_qp(), &tmp_wr, &bad_tx_work_request)) {
+        ldout(cct, 1) << __func__ << " error sending RDMA WRITE_IMMD." << dendl;
+        ceph_abort();
+        break;
+      }
+
+      qp->add_tx_wr(1);
     }
+      
   }
 
+}
 
 ssize_t RDMAConnectedSocketImpl::read(char* buf, size_t len)
 {
@@ -348,9 +458,11 @@ ssize_t RDMAConnectedSocketImpl::read(char* buf, size_t len)
 
   // for RDMA Read notifications
   std::vector<uint32_t> rdma_cmpls(cqe.size());
+  std::vector<uint64_t> rdma_pending_reply(cqe.size());
 
   // for buffering out of order works
-  std::vector< std::pair<uint32_t, Chunk*> > rdma_out_of_order(cqe.size()); 
+  std::vector< std::pair<uint32_t, Chunk*> > rdma_out_of_order(cqe.size());
+   
 
   bool out_of_order = false; // when to start buffering
 
@@ -360,18 +472,26 @@ ssize_t RDMAConnectedSocketImpl::read(char* buf, size_t len)
     ibv_wc* response = &cqe[i];
     assert(response->status == IBV_WC_SUCCESS);
 
+    const uint32_t rem_send_seq = ntohl(reponse->imm_data);
+
+
     // need to check if IBV_WR_RDMA_WRITE_WITH_IMM
     Chunk* chunk = reinterpret_cast<Chunk *>(response->wr_id);
     if(response->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
       
       assert(!response->byte_len); // no data is sent       
 
-      const uint32_t rdma_reg_id = ntohl(reponse->imm_data);    // need to retrieve host-based value
+      //const uint32_t rdma_reg_id = ntohl(reponse->imm_data);    // need to retrieve host-based value
       ldout(cct, 25) << __func__ << "WRITE_IMM ID: " << static_cast<long>(rdma_reg_id) << dendl;
 
-      rdma_cmpls.push_back(rdma_reg_id);
+      rdma_cmpls.push_back(rem_send_seq);
       // done with this chunk
       dispathcer->post_chunk_to_pool(chunk);
+      continue;
+    }
+
+    if(response->opcode == IBV_WC_RDMA_READ) {
+      rdma_pending_reply.push_back(response->wr_id);
       continue;
     }
 
@@ -391,18 +511,17 @@ ssize_t RDMAConnectedSocketImpl::read(char* buf, size_t len)
       // need to check the sequence number
       
  
-     const uint32_t rec_sec = ntohl(response->imm_data);
 
-     if(out_of_order || !rdma_is_seq_larger(rec_sec, m_rdma_recv_seq.load())) {
+     if(out_of_order || !rdma_is_seq_larger(rem_send_seq, m_rdma_recv_seq.load())) {
        out_of_order = true;
        // buffer data
-       rdma_out_of_order.push_back(std::make_pair<uint32_t, Chunk*>(rec_sec, chunk));
+       rdma_out_of_order.push_back(std::make_pair<uint32_t, Chunk*>(rem_send_seq, chunk));
        
-       continue
+       continue;
      }
 
       // need to update recv_seq number
-      m_rdma_recv_seq.fetch_add(response->byte_len);
+      m_rdma_recv_seq.store((rem_send_seq + 1));;
 
 
       if (read == (ssize_t)len) {
@@ -427,10 +546,11 @@ ssize_t RDMAConnectedSocketImpl::read(char* buf, size_t len)
     submit(false);
   }
 
+
   // need to pass the data structures for the internal use
-  if(!rdma_cmpls.empty() || !rdma_out_of_order.empty()) {
+  if(!rdma_cmpls.empty() || !rdma_out_of_order.empty() || !rdma_pending_reply.empty()) {
     // need to update internal data structures
-    handle_rdma_structures(rdma_compls, rdma_out_of_order);    
+    handle_rdma_structures(rdma_compls, rdma_pending_reply, rdma_out_of_order);    
   }
 
   if (!buffers.empty()) {
@@ -536,16 +656,32 @@ ssize_t RDMAConnectedSocketImpl::send(bufferlist &bl, bool more)
 
   {
     Mutex::Locker l(lock);
-     
-    
+      
     // need to check if use RDMA READ
     if(direct_RDMA) {
-      // Direct memory access (RDMA READ)
-      bufferlist data_buff;
-      data_buff.claim_append(bl);
-      m_rdma_data.push_back(std::make_pair<char*, bufferlist>(pending_bl.buffers().back.raw_c_str(), std::move(data_buff)));
+      if(m_last_append_RDMA) {
+        // merge two RDMA operations into one
+        m_rdma_data.back.second.claim_append(bl);
+      }
+      else {
+
+        // Direct memory access (RDMA READ)
+
+        bufferlist data_buff;
+        data_buff.claim_append(bl);
+      
+        if(pending_bl.length()) {
+          m_rdma_data.push_back(std::make_pair<char*, bufferlist>(pending_bl.buffers().back.raw_c_str(), std::move(data_buff)));
+        }
+        else {
+          // if pending_bl is totally empty
+          m_rdma_data_push_back(std::make_pair<char*, bufferlist>(nullptr, std::move(data_buff)));
+        }
+      }
+      m_last_append_RDMA = true;
     }
     else {  
+      m_last_append_RDMA = false;
       pending_bl.claim_append(bl);
     }
 
@@ -571,10 +707,23 @@ ssize_t RDMAConnectedSocketImpl::submit(bool more)
   if (error)
     return -error;
   Mutex::Locker l(lock);
+
+  size_t rdma_read_bytes = 0;
+  bufferlist rem_list;
+  if(!m_rdma_data.front.first) {
+    //need to perform RDMA read
+    rdm_read_bytes = perform_rdma_read(rem_list, m_rdma_send_seq);
+    ++m_rdma_send_seq; 
+  }
+
+  if(rem_list.length()) {
+    // prepend it to the list
+    pending_bl.claim_prepend(rem_list);
+  }
   size_t bytes = pending_bl.length();
   ldout(cct, 20) << __func__ << " we need " << bytes << " bytes. iov size: "
                  << pending_bl.buffers().size() << dendl;
-  if (!bytes)
+  if (!bytes && !rdma_read_bytes)
     return 0;
 
   auto fill_tx_via_copy = [this](std::vector<Chunk*> &tx_buffers, unsigned bytes,
@@ -617,51 +766,85 @@ ssize_t RDMAConnectedSocketImpl::submit(bool more)
   unsigned total = 0;
   unsigned need_reserve_bytes = 0;
 
-  uint32_t rdma_seq_offset = 0
-  bool     apply_rdma = false;
+
+  if(!m_rdma_data.empty()) {
+    auto term_itr = m_rdma_data.front.first;
+
+    while(it->raw_c_str() != term_itr) {
+      if(infiniband->is_tx_buffer(it->raw_c_str())) {
+        if(need_reserve_bytes) {
+          unsigned int copied = fill_tx_via_copy(tx_buffers, need_reserve_bytes, copy_it, it);
+          total += copied;
+          if(copied < need_reserve_bytes) {
+            goto sending:
+          }
+
+          need_reserve_bytes = 0;
+
+        }
+          assert(copy_it == it);
+          tx_buffers.push_back(infiniband->get_tx_chunk_by_buffer(it->raw_c_str()));
+          total += it->length();
+          ++copy_it;
+      } else {
+          need_reserve_bytes += it->length();
+       }
+
+        ++it;
+    }
+
+    // need to fill info of this buffer
+    const unsigned before_needs_copied = need_reserve_bytes;
+
+    need_reserve_bytes += itr->length();
+    const unsigned copied_data = fill_tx_via_copy(tx_buffers, need_reserve_bytes, copy_it, ++it);
+    total += copied_data
+
+    if(copied_data <= before_needs_copied) {
+      goto sending:
+    }
+
+    // we either call RDAM READ or suspend until next time
+    if(copied_data == need_reserve_bytes) {
+      // RDMA READ can be issues
+      const uint32_t seq_num =  m_rdma_send_seq + tx_buffers.size();
+      perform_rdma_read(rem_list, seq_num);
+      
+      
+    } else {
+      // update RDMA list
+      const unsigned offset = need_reserve_bytes - copied_data;
+      m_rdma_data.front.first = (it->raw_c_str() + offset);
+    }
+
+    
+    goto sending: // send the data 
+
+  }
  
 
   while (it != pending_bl.buffers().end()) {
-    if(!m_rdma_data.empty() && 
-        m_rdma_data.front.first == itr->raw_c_str()) {
-    
-      // after this operation, RDMA Read waits
-      apply_rdma = true; 
-    }
-  
     if (infiniband->is_tx_buffer(it->raw_c_str())) {
       if (need_reserve_bytes) {
         unsigned copied = fill_tx_via_copy(tx_buffers, need_reserve_bytes, copy_it, it);
         total += copied;
         if (copied < need_reserve_bytes) {
-          if(apply_rdma) {
-            // need to update key
-            
-          }
           goto sending;
         }
         need_reserve_bytes = 0;
       }
       assert(copy_it == it);
       tx_buffers.push_back(infiniband->get_tx_chunk_by_buffer(it->raw_c_str()));
-      ++rdma_seq_offset;
+ 
       total += it->length();
       ++copy_it;
     } else {
       need_reserve_bytes += it->length();
     }
-    
-    if(apply_rdma)
-    {
-      apply_rdma = false; 
-      // set sequence number for this read
-      
-       
-      perform_rdma_read(rdma_seq_offset); 
-    }
 
     ++it;
   }
+
   if (need_reserve_bytes)
     total += fill_tx_via_copy(tx_buffers, need_reserve_bytes, copy_it, it);
 
@@ -674,9 +857,16 @@ ssize_t RDMAConnectedSocketImpl::submit(bool more)
     worker->perf_logger->inc(l_msgr_rdma_tx_parital_mem);
     pending_bl.splice(total, pending_bl.length()-total, &swapped);
     pending_bl.swap(swapped);
+
   } else {
     pending_bl.clear();
   }
+
+   // left some RDMA read data 
+   if(rem_list.length()) {
+     pending_bl.claim_prepend(rem_list);
+   }
+
 
   ldout(cct, 20) << __func__ << " left bytes: " << pending_bl.length() << " in buffers "
                  << pending_bl.buffers().size() << " tx chunks " << tx_buffers.size() << dendl;
@@ -690,22 +880,89 @@ ssize_t RDMAConnectedSocketImpl::submit(bool more)
 }
 
 
-ssize_t RDMAConnectedSocketImpl::perform_rdma_read() {
-  
 
+unsigned RDMAConnectedSocketImpl::allocate_read_region(std::vector<Chunk*>& data, const unsigned len)
+{
+
+  // start reading
+  int ret = worker->get_reged_mem(this, data, len);
+
+  if(ret == 0) {
+    ldout(cct, 1) << __func__ << " no enough buffer in worker " << worker << dendl;
+    return 0;
+  }
+
+  return (data.front->bytes * data.size());
+
+}
+
+ssize_t RDMAConnectedSocketImpl::perform_rdma_read(bufferlist& bl, const uint32_t seq_num) {
+  
+  assert(m_rdma_data.size()); // make sure we have something to read
+
+  auto itr = m_rdma_data.find(seq_num); // check if there is no errors
+  
+  if(itr != m_rdma_data.end()) {
+    lderr(cct) << __func__ << " rdma_data_map hit the same key." << dendl;
+    ceph_abort();
+  }
+ 
+
+  // need to preallocate data
+
+  std::pair<char*, bufferlist> data_buffer = m_rdma_data.front;
+
+  const unsigned int read_region_size = data_buffer.second.length(); 
+
+  std::vector<Chunk*> read_memory;
+
+
+  // now need to preallocate buffers for remote reading so that
+  // a remote host could access local memory for reading from it
+  const unsigned int d_alloc =  allocate_read_region(read_memory, read_region_size);
+
+  if(!d_alloc) {
+    return 0; // wait for the next round
+  }  
+
+
+  m_rdma_data.pop_front(); // might need to mofidy or won't need to append at all
+
+  if(d_alloc < read_region_size) {
+    // we have two options
+    const unsigned int left_data = read_region_size - d_alloc;    
+
+
+    if(left_data >= RDMAConnectedSocketImpl::RDMA_DIRECT_THRESH) { // another RDMA read required
+     bufferlist next_rdma;
+     data_buffer.second.splice(d_alloc, read_region_size - d_alloc, &next_rdma);
+     
+     m_rdma_data.push_front(std::make_pair<char*, bufferlist>(data_buffer.first, std::move(next_rdma)));     
+    } else{
+    
+      // send the rest of the data with a simple RDMA_SEND
+      data_buffer.second.splice(d_alloc, read_region_size - d_alloc, &bl);
+    }
+ 
+  }
+
+  // keep track of the allocated memory
+  m_rdma_send_buf[seq_num] = std::move(read_memory);
 
   rdma_remote_region_d read_request;
   read_request.rdma_tag = RDMA_REQUEST_TAG;
-  read_request.uq_key  = 0;
-  read_request.rlength = 0;
-  read_request.rkey    = 0; // Chunk key since they all share one  
-                            // region
+  read_request.uq_key   = seq_num;
+  read_request.rlength  = (uint32_t) d_alloc;
+  read_request.rkey     = read_memory.front->lkey; // Chunk key since they all share one  
+                                                   // region
 
-  read_request.raddr   = 0;  // Chunk address
+  read_request.raddr    = (uint64_t) read_memory.front->buffer;  // Chunk address
 
   const bool result = send_rdma_control(&read_request);
 
-  return ((result) ? 0 : -1);
+  assert(result);
+
+  return ((result) ? (ssize) d_alloc : -1);
 
 }
 
@@ -774,6 +1031,106 @@ bool RDMAConectedSocketImpl::send_rdma_control(const struct rdma_msg_d* msg){
   
 }
 
+
+
+ssize_t RDMAConnectedSocketImpl::do_remote_rdma_read(const struct rdma_remote_region_d* request)
+{
+  ldout(cct, 20) << __func__ << " Staring a remote RDMA read"  << dendl;
+
+
+  // need to allocate memory
+ 
+
+  std::vector<Chunk*> rx_memory;
+  Chunk* chunk;
+
+  uint32_t cur_alloc = 0; // need to allocate that much memory
+
+  while(cur_alloc < request.rlength) {
+    chunk = infiniband->get_memory_manager()->get_rx_buffer();
+    if(chunk == nullptr) {
+      lderr(cct) << __func__ " RDMA Read failed to allocate memory" << dendl;
+      // release all the memory
+      for(auto&& mem_chunk : rx_memory) {
+        infiniband->get_memory_manager()->release_rx_buffer(mem_chunk);
+      }
+
+      ceph_abort();
+      return -1;
+    }
+    
+    cur_alloc += chunk->bytes; 
+    rx_memory.push_back(chunk);
+    
+  } // while
+
+
+  assert(rx_memory.size());
+
+  ldout(cct, 20) << __func__ << " survived memory allocation step for RDMA READ at reader" << dendl;
+
+  // perform RDMA read
+  ibv_send_wr rdma_op;
+  ibv_sge isge[rx_memory.size()];
+
+
+  memset(rdma_op, 0, sizeof(rdma_op));
+  memset(isge, 0, sizeof(isge));
+
+
+  // initialize the work request first
+  rdma_op.wr_id                =   reinterpret_cast<uint64_t>(rx_memory.front);
+  rdma_op.next                 =   NULL;
+  rdma_op.sg_list              =   isge;
+  rdma_op.num_sge              =   static_cast<int>(rx_memory.size());
+  rdma_op.opcode               =   IBV_WR_RDMA_READ;
+  rdma_op.send_flags           =   IBV_SEND_SIGNALED;
+  rdma_op.wr.rdma.remote_addr  =   request.raddr;
+  rdma_op.wr.rdma.rkey         =   request.rkey;
+  
+
+  auto mem_itr = rx_memory.begin();  
+
+  // initialize the list of gathers
+  for(decltype(rx_memory.size()) i = 0; i < rx_memory.size(); ++i) {
+      isge[i].addr    =  reinterpret_cast<uint64_t>((*mem_itr)->buffer);
+      isge[i].length  =  (*mem_itr)->get_offset();
+      isge[i].lkey    =  (*mem_itr)->mr->lkey;
+  }  
+
+
+  ldout(cct, 20) << __func__ << " sending RDMA READ operation" << dendl;
+
+  ibv_send_wr *bad_tx_work_request;
+  if(ibv_post_send(qp->get_qp(), &rdma_op, &bad_tx_work_request)) {
+    ldout(cct, 1) << __func__ << " failed to send data"
+                              << " (RDMA READ did not work): "
+                              << cpp_strerror(errno) << dendl;
+
+    return -errno; 
+  } 
+
+  // completed the request
+  qp->add_tx_wr(1);
+  worker->perf_logger->inc(l_msgr_rdma_tx_chunks, rx_memory.size());
+  ldout(cct, 20) << __func__ << " qp state is " << Infiniband::qp_state_string(qp->get_state()) << dendl;
+
+
+
+  // need to enqueue the memory region
+  const uint64_t read_key = reinterpret_cast<uint64_t>(rx_memory.front);
+  std::pair<uint32_t, std::vector<Chunk*> > read_struct = std::make_pair<uint32_t, std::vector<Chunk*> > (request.uq_key, std::move(rx_memory));
+
+
+  // update the read structure
+  Mutex::Locker l(m_rdma_read_lock);
+  m_rdma_read_buf[read_key] = std::move(read_struct);
+
+  return 0;
+
+}
+
+
 bool RDMAConnectedSocketImpl::handle_rdma_control() {
   // read
 
@@ -816,6 +1173,7 @@ bool RDMAConnectedSocketImpl::handle_rdma_control() {
 
   // enqueue request or something
 
+  do_remote_rdma_read(&temp_remote);
 
   
   return true; // read message
@@ -953,28 +1311,41 @@ void RDMAConnectedSocketImpl::fault(const struct ibv_wc* const cperr)
   if(cperr && cperr->opcode == IBV_WC_RDMA_READ) {
   
     ldout(cct, 1) << __func__ " RDMA READ failed." << dendl;
+
  
     // RDMA read failed
     // need to release memory for reading
-    Mutex::Locker l(m_rdma_read_lock);
+  
+    std::vector<Chunk*> release_mem; 
     
-    // get the address to release
-    const uint64_t laddr = cperr->wr_id;
-    auto itr_del = m_rdma_read_buf.find(laddr);
+    {
+      Mutex::Locker l(m_rdma_read_lock);
     
-    if(itr_del != m_rdma_rdma_read_buf.end()) {
-      // move this region to the delete vectors
-      m_free_rdma_bufs.push_back(
-          std::move(itr_del->second));
+      // get the address to release
+      const uint64_t laddr = cperr->wr_id;
+      auto itr_del = m_rdma_read_buf.find(laddr);
+    
+      if(itr_del != m_rdma_rdma_read_buf.end()) {
+        // delete the memory region from the registered map
+        // release memory
+        release_mem = itr_del->second.second;
+        m_rdma_read_buf.erase(itr_del);
 
-      // delete the memory region from the registered map
-      m_rdma_read_buf.erase(itr_del);
-    }
-    else {
-      ldout(cct, 10) << __func__ << 
-          " RDMA READ buffer has not been preallocated" << dendl;
-    }//else
-      
+      }
+      else {
+        ldout(cct, 10) << __func__ << 
+            " RDMA READ buffer has not been preallocated" << dendl;
+      }//else
+
+    }// end Mutex region
+
+     if(!release_mem.empty()) { // since the RDMA READ uses RX memory pool 
+       
+       for(auto& chunk : release_mem) {
+        infiniband->post_chunk_to_pool(chunk);
+       }
+     }
+    
   }//if
 
 

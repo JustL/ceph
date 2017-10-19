@@ -252,10 +252,11 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
   // for remote reading
   
     
-  // lock for modyfing local memory used for RDMA read buffers
-  Mutex m_rdma_read_lock; 
+  // lodsk for modyfing local memory used for RDMA read buffers
+  Mutex m_rdma_read_lock;
+  Mutex m_rdma_gl_lock;  // for global strucutres 
   
-  
+
   // for ensuring that data to the user is delivered in order
   uint32_t  m_rdma_send_seq; // for sending sequence unit - work request 
                              // number(no need for atomic)
@@ -264,19 +265,21 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
   std::atomic<uint32_t>  m_rdma_recv_seq; // for receiving sequence number
                                           // unit -- work request
 
+  bool m_last_append_RDMA;                // was last send request
+                                          // to RDMA functions
 
   // need to ensure that data always delivered in order
-  std::map<uint32_t, Chunk*, std::function<bool(const uint32_t&, const uint64_t&)> > m_rdma_rec_buffers;
+  std::map<uint32_t, Chunk*, std::function<bool(const uint32_t&, const uint32_t&)> > m_rdma_rec_buffers;
     
-  // for placing error/complete buffers
-  std::vector<std::pair<uint32_t, std::vector<Chunk*> > m_free_rdma_bufs;
  
   // for storing state of currently happening RDMA operations
   ceph::unordered_map<uint32_t, std::vector<Chunk*> > m_rdma_send_buf;
-  std::vector<std::pair<char*, bufferlist> > m_rdma_data;  
+  std::list<std::pair<char*, bufferlist> > m_rdma_data;  
  
 
   ceph::unordered_map<uint64_t, std::pair<uint32_t, std::vector<Chunk*> > > m_rdma_read_buf;  
+
+  bool m_last_append_RDMA;                // was last send request handled by RDMA Read
  
 
   /**
@@ -286,8 +289,10 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
   bool send_rdma_control(const struct rdma_msg_d* msg);
  
 
-  void perform_rdma_read();
-  bool handle_rdma_control();  
+  unsigned allocate_read_region(std::vector<Chunk*>& data, const unsigned len);
+  ssize_t perform_rdma_read(bufferlist& bl, const uint32_t seq_num);
+  bool handle_rdma_control(); 
+  ssize_t do_remote_rdma_read(const struct rdma_remote_region_d* request); 
 
 
   /**
@@ -338,7 +343,8 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
    *
    */ 
   void handle_rdma_structures(const std::vector<uint32_t>& send_buff,
-  std::vector<std::pair<uint32_t, Chunk*> >& inter_rec);  
+                              const std::vector<uint64_t>& pending_replies,
+                              std::vector<std::pair<uint32_t, Chunk*> >& inter_rec);  
 
   void notify();
   ssize_t read_buffers(char* buf, size_t len);
@@ -370,6 +376,8 @@ class RDMAConnectedSocketImpl : public ConnectedSocketImpl {
   int try_connect(const entity_addr_t&, const SocketOptions &opt);
   bool is_pending() {return pending;}
   void set_pending(bool val) {pending = val;}
+
+
   class C_handle_connection : public EventCallback {
     RDMAConnectedSocketImpl *csi;
     bool active;

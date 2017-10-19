@@ -437,8 +437,28 @@ void RDMADispatcher::handle_tx_event(ibv_wc *cqe, int n)
 
       case IBV_WC_RDMA_READ: { // RDMA READ 
           /* ADD SOME CODE HERE */
-          // need to notify the remote host that an operations
-          // is completed
+          if(reponse->status == IBV_WC_SUCCESS) { 
+              // since IBV_WC_RDMA_READ uses the send queue
+              // to generte operations and completions are sent to the tx_cmq,
+              // need to handle this case specially. RDMA_READ uses rx_memory_pool
+              // so need to deal with it.
+              
+              Mutex::Locker l(lock); // make sure connected socket alive when pass wc
+              RDMAConnectedSocketImpl *conn = get_conn_lockless(reponse->qp_num);
+              
+              if(conn && conn->is_connected()) {
+                ldout(cct, 25) << __func__ << " qp state is : " << conn->get_qp_state() << dendl;
+                std::vector<ibv_wc> polled(1, *response);
+                conn->pass_wc(std::move(polled));
+              } else {
+                ldout(cct, 1) << __func__ << " missing qp_num=" << response->qp_num << " discard event" << dendl;
+                }
+                
+          }
+
+          break;
+       }// case IBV_WC_RDMA_READ 
+          
       }
       
 
